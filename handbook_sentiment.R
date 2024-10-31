@@ -1,0 +1,111 @@
+library(tidyverse)
+library(tidytext)
+library(readxl)
+library(tidyr)
+library(janeaustenr)
+library(dplyr)
+library(stringr)
+library(wordcloud)
+library(reshape2)
+
+# school handbook data
+schools <- read_csv('data/school_handbooks.csv')
+file_list <- pull(schools, path)
+filenames <- pull(schools, filename)
+
+# import text files from directory
+txt <- file_list %>% 
+  map_chr(~ read_file(.)) %>% 
+  tibble(name = filenames, text = .) %>% 
+  mutate(doc_id = str_remove(name, '.txt')) %>% 
+  head(100)
+
+# tokenize documents into sentences
+dict <- read_xlsx('data/handbook_dictionary.xlsx', sheet = 'dictionary') %>% 
+  pull(word)
+
+txt_sent <- txt %>% 
+  select(-name) %>% 
+  unnest_tokens(sent, text, token='sentences') %>% 
+  group_by(doc_id) %>% 
+  mutate(sent_no = 1:length(doc_id)) %>% 
+  ungroup()
+
+txt_proc <- txt_sent %>% 
+  unnest_tokens(word, sent) %>% 
+  anti_join(get_stopwords()) %>% 
+  mutate(word = str_remove(word, "[^\\w]")) %>% 
+  filter(!str_detect(word, "[\\d+]"), word %in% dict)
+
+# sentiment lexicons
+afinn <- get_sentiments('afinn')
+nrc <- get_sentiments('nrc')
+vad <- read_delim('data/lexicons/NRC-VAD-lexicon.txt', delim = '\t') %>% 
+  rename(word = Word)
+
+hb_nrc <- txt_proc %>% 
+  inner_join(nrc)
+
+hb_nrc_sent <- hb_nrc %>% 
+  count(doc_id, sent_no, sentiment)
+
+hb_vad <- txt_proc %>% 
+  inner_join(vad)
+
+hb_afinn <- txt_proc %>% 
+  inner_join(get_sentiments("afinn")) %>% 
+  group_by(index = sent_no %/% 80) %>% 
+  summarise(sentiment = sum(value)) %>% 
+  mutate(method = "AFINN")
+
+bing_and_nrc <- bind_rows(
+  txt_proc %>% 
+    inner_join(get_sentiments("bing")) %>%
+    mutate(method = "Bing et al."),
+  txt_proc %>% 
+    inner_join(get_sentiments("nrc") %>% 
+                 filter(sentiment %in% c("positive", 
+                                         "negative"))
+    ) %>%
+    mutate(method = "NRC")) %>%
+  count(method, index = sent_no %/% 80, sentiment) %>%
+  pivot_wider(names_from = sentiment,
+              values_from = n,
+              values_fill = 0) %>% 
+  mutate(sentiment = positive - negative)
+
+bind_rows(hb_afinn, 
+          bing_and_nrc) %>%
+  ggplot(aes(index, sentiment, fill = method)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~method, ncol = 1, scales = "free_y")
+
+nrc_word_counts <- txt_proc %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, sentiment, sort = TRUE) %>%
+  ungroup()
+
+nrc_word_counts %>%
+  group_by(sentiment) %>%
+  slice_max(n, n = 10) %>% 
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(n, word, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free_y") +
+  labs(x = "Contribution to sentiment",
+       y = NULL)
+
+wordcloud <- txt_proc %>%
+  anti_join(stop_words) %>%
+  count(word) %>%
+  with(wordcloud(word, n, max.words = 100,
+                 scale = c(2, 0.2)))
+ 
+
+wordcloud_bing <- txt_proc %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, sentiment, sort = TRUE) %>%
+  acast(word ~ sentiment, value.var = "n", fill = 0) %>%
+  comparison.cloud(colors = c("gray20", "gray80"),
+                   max.words = 100, scale = c(1, 0.2))
